@@ -54,23 +54,35 @@ def load_policy(checkpoint_path, device):
     state_dim = checkpoint["state_dim"]
     action_dim = checkpoint["action_dim"]
     config = checkpoint.get("config", {})
+    chunk_size = config.get("chunk_size", checkpoint.get("chunk_size", 1))
+    num_modes = config.get("num_modes", checkpoint.get("num_modes", 5))
 
-    class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
+    class MDNPolicy(nn.Module):
+        def __init__(self, state_dim, action_dim, hidden_dim=256, chunk_size=1, num_modes=5):
             super().__init__()
+            self.action_dim = action_dim
+            self.chunk_size = chunk_size
+            self.num_modes = num_modes
+            self.out_dim = action_dim * chunk_size
             self.net = nn.Sequential(
                 nn.Linear(state_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
-                nn.Tanh(),
+                nn.ReLU()
             )
+            self.pi_head = nn.Linear(hidden_dim, num_modes)
+            self.mu_head = nn.Linear(hidden_dim, num_modes * self.out_dim)
+            self.sigma_head = nn.Linear(hidden_dim, num_modes * self.out_dim)
 
         def forward(self, state):
-            return self.net(state)
+            x = self.net(state)
+            pi = self.pi_head(x)
+            mu = self.mu_head(x).view(-1, self.num_modes, self.out_dim)
+            sigma = nn.functional.elu(self.sigma_head(x)) + 1.0 + 1e-5
+            sigma = sigma.view(-1, self.num_modes, self.out_dim)
+            return pi, mu, sigma
 
     class ResidualBlock(nn.Module):
         def __init__(self, dim, dropout=0.1):
@@ -87,12 +99,14 @@ def load_policy(checkpoint_path, device):
         def forward(self, x):
             return x + self.block(x)
 
-    class ImprovedPolicy(nn.Module):
+    class ImprovedMDNPolicy(nn.Module):
         def __init__(self, state_dim, action_dim, hidden_dim=512,
-                     n_blocks=6, dropout=0.1, chunk_size=1):
+                     n_blocks=6, dropout=0.1, chunk_size=1, num_modes=5):
             super().__init__()
             self.chunk_size = chunk_size
             self.action_dim = action_dim
+            self.num_modes = num_modes
+            self.out_dim = action_dim * chunk_size
             self.input_proj = nn.Sequential(
                 nn.Linear(state_dim, hidden_dim),
                 nn.GELU(),
@@ -100,30 +114,40 @@ def load_policy(checkpoint_path, device):
             self.blocks = nn.Sequential(
                 *[ResidualBlock(hidden_dim, dropout) for _ in range(n_blocks)]
             )
-            self.head = nn.Sequential(
+            self.pi_head = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, action_dim * chunk_size),
-                nn.Tanh(),
+                nn.Linear(hidden_dim, num_modes)
+            )
+            self.mu_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, num_modes * self.out_dim)
+            )
+            self.sigma_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, num_modes * self.out_dim)
             )
 
         def forward(self, state):
             x = self.input_proj(state)
             x = self.blocks(x)
-            out = self.head(x)
-            if self.chunk_size > 1:
-                out = out.view(-1, self.chunk_size, self.action_dim)
-            return out
+            pi = self.pi_head(x)
+            mu = self.mu_head(x).view(-1, self.num_modes, self.out_dim)
+            sigma = nn.functional.elu(self.sigma_head(x)) + 1.0 + 1e-5
+            sigma = sigma.view(-1, self.num_modes, self.out_dim)
+            return pi, mu, sigma
 
-    model_type = config.get("model", "simple")
+    model_type = config.get("model", checkpoint.get("model_type", "mdn_policy"))
     if model_type == "improved":
-        model = ImprovedPolicy(
+        model = ImprovedMDNPolicy(
             state_dim, action_dim,
             hidden_dim=config.get("hidden_dim", 512),
             n_blocks=config.get("n_blocks", 6),
             dropout=config.get("dropout", 0.1),
+            chunk_size=chunk_size,
+            num_modes=num_modes
         ).to(device)
     else:
-        model = SimplePolicy(state_dim, action_dim).to(device)
+        model = MDNPolicy(state_dim, action_dim, chunk_size=chunk_size, num_modes=num_modes).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -131,9 +155,9 @@ def load_policy(checkpoint_path, device):
     print(f"Loaded policy from: {checkpoint_path}")
     print(f"  Model type: {model_type}")
     print(f"  Trained for {checkpoint['epoch']} epochs, loss={checkpoint['loss']:.6f}")
-    print(f"  State dim: {state_dim}, Action dim: {action_dim}")
+    print(f"  State dim: {state_dim}, Action dim: {action_dim}, Chunk size: {chunk_size}")
 
-    return model, state_dim, action_dim
+    return model, state_dim, action_dim, chunk_size
 
 
 def extract_state(obs, state_dim):
@@ -208,13 +232,33 @@ def run_evaluation(
 
         ep_reward = 0.0
         success = False
+        action_buffer = []
 
         for step in range(max_steps):
-            # Extract state and predict action
-            state = extract_state(obs, state_dim)
-            with torch.no_grad():
-                state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
-                action = model(state_tensor).cpu().numpy().squeeze(0)
+            if len(action_buffer) == 0:
+                # Extract state and predict action chunk
+                state = extract_state(obs, state_dim)
+                with torch.no_grad():
+                    state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
+                    pi, mu, sigma = model(state_tensor)
+                    pi = pi.cpu().numpy().squeeze(0)
+                    mu = mu.cpu().numpy().squeeze(0)
+                    
+                    # Sample mode
+                    best_mode = np.argmax(pi)
+                    action_pred = mu[best_mode]
+                    
+                # Store chunk into buffer. action_pred is always (out_dim,) shaped inside numpy.
+                # If chunk_size > 1, we must reshape back
+                if model.chunk_size > 1:
+                    action_pred = action_pred.reshape(model.chunk_size, model.action_dim)
+                    for a in action_pred:
+                        action_buffer.append(a)
+                else:
+                    action_buffer.append(action_pred)
+                        
+            # Pop the first action from buffer
+            action = action_buffer.pop(0)
 
             # Pad action to match environment action dim if needed
             env_action_dim = env.action_dim
@@ -298,7 +342,7 @@ def main():
     print(f"Device: {device}")
 
     # Load the trained policy
-    model, state_dim, action_dim = load_policy(args.checkpoint, device)
+    model, state_dim, action_dim, chunk_size = load_policy(args.checkpoint, device)
 
     # Run evaluation
     print_section(f"Evaluating on {args.split} split ({args.num_rollouts} episodes)")

@@ -432,9 +432,8 @@ def _check_display():
         os.environ.setdefault("MESA_GL_VERSION_OVERRIDE", "4.5")
         return
 
-    if display:
-        # Some X display is claimed — let MuJoCo's own error handling deal
-        # with actual render failures.
+    if sys.platform == "darwin":
+        # macOS with mjpython handles the display natively
         return
 
     # Nothing set at all.

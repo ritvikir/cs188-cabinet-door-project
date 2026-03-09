@@ -85,9 +85,10 @@ def train_simple_policy(config):
         Full visuomotor training with images requires the Diffusion Policy repo.
         """
 
-        def __init__(self, dataset_path, max_episodes=None):
+        def __init__(self, dataset_path, max_episodes=None, chunk_size=1):
             import pyarrow.parquet as pq
 
+            self.chunk_size = chunk_size
             self.states = []
             self.actions = []
 
@@ -157,6 +158,26 @@ def train_simple_policy(config):
                         if state_parts and action_parts:
                             self.states.append(np.array(state_parts, dtype=np.float32))
                             self.actions.append(np.array(action_parts, dtype=np.float32))
+                            
+                    # Process episode for chunking
+                    if self.chunk_size > 1 and len(self.actions) > 0:
+                        # Extract the newly added actions for this episode
+                        # To do this safely per episode, we would ideally track episode start indices.
+                        # Assuming each parquet chunk/file contains entire episodes or we chunk across the 
+                        # entire file, we chunk the recently added sequence.
+                        last_ep_start = len(self.states) - len(df)
+                        if last_ep_start >= 0:
+                            ep_actions = self.actions[last_ep_start:]
+                            chunked_actions = []
+                            for i in range(len(ep_actions)):
+                                chunk = ep_actions[i:i + self.chunk_size]
+                                # Pad if needed
+                                if len(chunk) < self.chunk_size:
+                                    pad_len = self.chunk_size - len(chunk)
+                                    pad = [chunk[-1]] * pad_len
+                                    chunk.extend(pad)
+                                chunked_actions.append(np.concatenate(chunk))
+                            self.actions[last_ep_start:] = chunked_actions
 
                 episodes_loaded += 1
                 if max_episodes and episodes_loaded >= max_episodes:
@@ -168,12 +189,30 @@ def train_simple_policy(config):
                 print("Generating synthetic demo data for illustration...")
                 self._generate_synthetic_data()
 
+            if self.chunk_size > 1 and len(self.actions) > 0:
+                # Synthetic generated actions need chunking as well
+                chunked_actions = []
+                for i in range(len(self.actions)):
+                    chunk = self.actions[i:i + self.chunk_size]
+                    if len(chunk) < self.chunk_size:
+                        pad_len = self.chunk_size - len(chunk)
+                        pad = [chunk[-1]] * pad_len
+                        chunk.extend(pad)
+                    chunked_actions.append(np.concatenate(chunk))
+                self.actions = chunked_actions
+                
             self.states = np.array(self.states, dtype=np.float32)
             self.actions = np.array(self.actions, dtype=np.float32)
+
+            # Reshape actions back to (N, chunk_size, action_dim)
+            if self.chunk_size > 1:
+                self.actions = self.actions.reshape(-1, self.chunk_size, self.actions.shape[-1] // self.chunk_size)
 
             print(f"Loaded {len(self.states)} state-action pairs")
             print(f"State dim:  {self.states.shape[-1]}")
             print(f"Action dim: {self.actions.shape[-1]}")
+            if self.chunk_size > 1:
+                print(f"Chunk size: {self.chunk_size}")
 
         def _generate_synthetic_data(self):
             """Generate synthetic data for demonstration purposes."""
@@ -193,7 +232,7 @@ def train_simple_policy(config):
                 torch.from_numpy(self.actions[idx]),
             )
 
-    dataset = CabinetDemoDataset(dataset_path, max_episodes=50)
+    dataset = CabinetDemoDataset(dataset_path, max_episodes=50, chunk_size=config["chunk_size"])
     dataloader = DataLoader(
         dataset,
         batch_size=config["batch_size"],
@@ -207,27 +246,79 @@ def train_simple_policy(config):
     state_dim = dataset.states.shape[-1]
     action_dim = dataset.actions.shape[-1]
 
-    class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
+    class MDNPolicy(nn.Module):
+        def __init__(self, state_dim, action_dim, hidden_dim=256, chunk_size=1, num_modes=5):
             super().__init__()
+            self.chunk_size = chunk_size
+            self.action_dim = action_dim
+            self.num_modes = num_modes
+            
+            # Action space multiplied by chunk size
+            self.out_dim = action_dim * chunk_size
+            
             self.net = nn.Sequential(
                 nn.Linear(state_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
-                nn.Tanh(),
+                nn.ReLU()
             )
+            
+            # MDN heads
+            self.pi_head = nn.Linear(hidden_dim, num_modes)
+            self.mu_head = nn.Linear(hidden_dim, num_modes * self.out_dim)
+            self.sigma_head = nn.Linear(hidden_dim, num_modes * self.out_dim)
 
         def forward(self, state):
-            return self.net(state)
+            x = self.net(state)
+            
+            # pi: probabilities of each mode (batch_size, num_modes)
+            pi = self.pi_head(x)
+            
+            # mu: means of each mode (batch_size, num_modes, out_dim)
+            mu = self.mu_head(x).view(-1, self.num_modes, self.out_dim)
+            
+            # sigma: std devs of each mode. Use ELU + 1 for ELU > -1 ensuring positivity (variance > 0)
+            sigma = nn.functional.elu(self.sigma_head(x)) + 1.0 + 1e-5
+            sigma = sigma.view(-1, self.num_modes, self.out_dim)
+            
+            return pi, mu, sigma
+
+    def mdn_loss(pi, mu, sigma, target):
+        """
+        Computes the Negative Log-Likelihood (NLL) for a Gaussian Mixture Model.
+        pi: (B, M) logits for probabilities
+        mu: (B, M, D) mapping
+        sigma: (B, M, D) standard deviations
+        target: (B, D) true action sequences
+        """
+        B, M, D = mu.shape
+        # Ensure target is shaped properly (B, 1, D) for broadcasting against (B, M, D)
+        target = target.view(B, 1, D)
+        
+        # Log probability of a Gaussian N(mu, sigma)
+        # log P(x) = sum_d [-0.5 * log(2*pi) - log(sigma) - 0.5 * ((x - mu) / sigma)^2]
+        var = sigma ** 2
+        logpath = -0.5 * ((target - mu) ** 2) / var
+        log_prob_gaussian = logpath - torch.log(sigma) - 0.5 * torch.log(torch.tensor(2 * np.pi, device=mu.device))
+        
+        # Sum over the action dimensions (D)
+        log_prob_gaussian = log_prob_gaussian.sum(dim=2) # Shape: (B, M)
+        
+        # Log Softmax of mode probabilities
+        log_pi = nn.functional.log_softmax(pi, dim=-1) # Shape: (B, M)
+        
+        # log(sum(exp(log_pi + log_prob_gaussian)))
+        loss = -torch.logsumexp(log_pi + log_prob_gaussian, dim=-1)
+        
+        return loss.mean()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
 
-    model = SimplePolicy(state_dim, action_dim).to(device)
+    num_modes = config.get("num_modes", 5)
+    model = MDNPolicy(state_dim, action_dim, chunk_size=config["chunk_size"], num_modes=num_modes).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
 
     # ----------------------------------------------------------------
@@ -253,8 +344,12 @@ def train_simple_policy(config):
             states_batch = states_batch.to(device)
             actions_batch = actions_batch.to(device)
 
-            pred_actions = model(states_batch)
-            loss = nn.functional.mse_loss(pred_actions, actions_batch)
+            # Actions batch is (B, chunk_size, action_dim) so we flatten to (B, chunk_size*action_dim)
+            if config["chunk_size"] > 1:
+                actions_batch = actions_batch.view(actions_batch.shape[0], -1)
+
+            pi, mu, sigma = model(states_batch)
+            loss = mdn_loss(pi, mu, sigma, actions_batch)
 
             optimizer.zero_grad()
             loss.backward()
@@ -279,6 +374,9 @@ def train_simple_policy(config):
                     "loss": best_loss,
                     "state_dim": state_dim,
                     "action_dim": action_dim,
+                    "chunk_size": config["chunk_size"],
+                    "num_modes": num_modes,
+                    "model_type": "mdn_policy"
                 },
                 ckpt_path,
             )
@@ -293,6 +391,9 @@ def train_simple_policy(config):
             "loss": avg_loss,
             "state_dim": state_dim,
             "action_dim": action_dim,
+            "chunk_size": config["chunk_size"],
+            "num_modes": num_modes,
+            "model_type": "mdn_policy"
         },
         final_path,
     )
@@ -370,6 +471,8 @@ def main():
         default="/tmp/cabinet_policy_checkpoints",
         help="Directory to save checkpoints",
     )
+    parser.add_argument("--chunk_size", type=int, default=1, help="Action chunking size")
+    parser.add_argument("--num_modes", type=int, default=5, help="Number of Gaussian Mixture modes for MDN")
     parser.add_argument(
         "--config",
         type=str,
@@ -400,6 +503,8 @@ def main():
             "batch_size": args.batch_size,
             "learning_rate": args.lr,
             "checkpoint_dir": args.checkpoint_dir,
+            "chunk_size": args.chunk_size,
+            "num_modes": args.num_modes,
         }
 
     train_simple_policy(config)
