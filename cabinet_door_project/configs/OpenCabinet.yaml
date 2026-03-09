@@ -1,0 +1,82 @@
+# Single-task config for OpenCabinet - use with dataset_paths override
+# Example: python train.py ... task=robocasa/OpenCabinet task.dataset.dataset_paths='[/content/data/OpenCabinet]'
+
+name: OpenCabinet
+
+shape_meta: &shape_meta
+  obs:
+    robot0_agentview_right_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: ['video.robot0_agentview_right']
+    robot0_agentview_left_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: ['video.robot0_agentview_left']
+    robot0_eye_in_hand_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: ['video.robot0_eye_in_hand']
+    robot0_base_to_eef_pos:
+      shape: [3]
+      lerobot_keys: ['state.end_effector_position_relative']
+    robot0_base_to_eef_quat:
+      shape: [4]
+      lerobot_keys: ['state.end_effector_rotation_relative']
+    robot0_gripper_qpos:
+      shape: [2]
+      lerobot_keys: ['state.gripper_qpos']
+    lang_emb:
+      shape: [768]
+  action:
+    shape: [12]
+    lerobot_keys: ['action.end_effector_position', 'action.end_effector_rotation', 'action.gripper_close', 'action.base_motion', 'action.control_mode']
+
+abs_action: &abs_action False
+
+env_runner:
+  _target_: diffusion_policy.env_runner.robomimic_image_runner.RobomimicImageRunner
+  dataset_path: /dev/null
+  shape_meta: *shape_meta
+  n_train: 0
+  n_train_vis: 0
+  n_test: 20
+  n_test_vis: 2
+  test_start_seed: 42
+  max_steps: 600
+  n_obs_steps: 2
+  n_action_steps: 8
+  render_obs_key: 'robot0_agentview_right_image'
+  fps: 10
+  crf: 22
+  past_action: False
+  abs_action: *abs_action
+  tqdm_interval_sec: 1.0
+  n_envs: 1
+  env_kwargs:
+    seed: 42
+    use_camera_obs: true
+    use_object_obs: true
+    camera_depths: false
+    has_renderer: false
+    has_offscreen_renderer: true
+    camera_names: ['robot0_agentview_left', 'robot0_agentview_right', 'robot0_eye_in_hand']
+    camera_widths: 256
+    camera_heights: 256
+    ignore_done: true
+    reward_shaping: false
+
+dataset:
+  _target_: diffusion_policy.dataset.lerobot_dataset.LerobotCotrainingDataset
+  shape_meta: *shape_meta
+  dataset_paths: ['/content/data/OpenCabinet']
+  horizon: 10
+  pad_before: 1
+  pad_after: 7
+  n_obs_steps: 2
+  abs_action: *abs_action
+  rotation_rep: 'rotation_6d'
+  use_legacy_normalizer: False
+  use_cache: True
+  seed: 42
+  val_ratio: 0.02

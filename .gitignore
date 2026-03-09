@@ -18,3 +18,18 @@ MUJOCO_LOG.TXT
 
 # Lock files
 uv.lock
+
+# macOS
+.DS_Store
+
+# Data and assets
+data/
+dataset/
+colab_data/
+checkpoints/
+
+# Checkpoints and logs
+*.pt
+*.mp4
+videos/
+.ipynb_checkpoints/

@@ -53,6 +53,7 @@ def load_policy(checkpoint_path, device):
 
     state_dim = checkpoint["state_dim"]
     action_dim = checkpoint["action_dim"]
+    config = checkpoint.get("config", {})
 
     class SimplePolicy(nn.Module):
         def __init__(self, state_dim, action_dim, hidden_dim=256):
@@ -71,11 +72,64 @@ def load_policy(checkpoint_path, device):
         def forward(self, state):
             return self.net(state)
 
-    model = SimplePolicy(state_dim, action_dim).to(device)
+    class ResidualBlock(nn.Module):
+        def __init__(self, dim, dropout=0.1):
+            super().__init__()
+            self.block = nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim, dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim, dim),
+                nn.Dropout(dropout),
+            )
+
+        def forward(self, x):
+            return x + self.block(x)
+
+    class ImprovedPolicy(nn.Module):
+        def __init__(self, state_dim, action_dim, hidden_dim=512,
+                     n_blocks=6, dropout=0.1, chunk_size=1):
+            super().__init__()
+            self.chunk_size = chunk_size
+            self.action_dim = action_dim
+            self.input_proj = nn.Sequential(
+                nn.Linear(state_dim, hidden_dim),
+                nn.GELU(),
+            )
+            self.blocks = nn.Sequential(
+                *[ResidualBlock(hidden_dim, dropout) for _ in range(n_blocks)]
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, action_dim * chunk_size),
+                nn.Tanh(),
+            )
+
+        def forward(self, state):
+            x = self.input_proj(state)
+            x = self.blocks(x)
+            out = self.head(x)
+            if self.chunk_size > 1:
+                out = out.view(-1, self.chunk_size, self.action_dim)
+            return out
+
+    model_type = config.get("model", "simple")
+    if model_type == "improved":
+        model = ImprovedPolicy(
+            state_dim, action_dim,
+            hidden_dim=config.get("hidden_dim", 512),
+            n_blocks=config.get("n_blocks", 6),
+            dropout=config.get("dropout", 0.1),
+        ).to(device)
+    else:
+        model = SimplePolicy(state_dim, action_dim).to(device)
+
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     print(f"Loaded policy from: {checkpoint_path}")
+    print(f"  Model type: {model_type}")
     print(f"  Trained for {checkpoint['epoch']} epochs, loss={checkpoint['loss']:.6f}")
     print(f"  State dim: {state_dim}, Action dim: {action_dim}")
 
